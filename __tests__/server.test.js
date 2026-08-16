@@ -7,8 +7,37 @@ const {
   rewriteCss,
   stripCookieDomain,
   detectLanguage,
-  pickProxyForSession
+  pickProxyForSession,
+  proxyKey,
+  proxyLabel
 } = app._internal;
+
+describe('proxyKey', () => {
+  test('is based on host:port, not username/password', () => {
+    const a = { host: '1.2.3.4', port: '8888', username: undefined, password: undefined };
+    const b = { host: '1.2.3.4', port: '8888', username: 'someone-else', password: 'pw' };
+    expect(proxyKey(a)).toBe('1.2.3.4:8888');
+    expect(proxyKey(a)).toBe(proxyKey(b));
+  });
+
+  test('distinguishes two credential-less proxies on different hosts (e.g. two tinyproxy boxes)', () => {
+    const a = { host: '1.2.3.4', port: '8888', username: undefined, password: undefined };
+    const b = { host: '5.6.7.8', port: '8888', username: undefined, password: undefined };
+    expect(proxyKey(a)).not.toBe(proxyKey(b));
+  });
+});
+
+describe('proxyLabel', () => {
+  test('uses the username when present', () => {
+    expect(proxyLabel({ host: '1.2.3.4', port: '8888', username: 'brd-customer-x' }))
+      .toBe('brd-customer-x');
+  });
+
+  test('falls back to host:port for credential-less proxies', () => {
+    expect(proxyLabel({ host: '1.2.3.4', port: '8888', username: undefined }))
+      .toBe('1.2.3.4:8888');
+  });
+});
 
 describe('stripCookieDomain', () => {
   test('removes a Domain attribute so the cookie scopes to the proxy host', () => {

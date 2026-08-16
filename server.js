@@ -64,6 +64,20 @@ let currentProxyIndex = 0;
 let proxyCheckInProgress = false;
 const proxyMiddlewareCache = new Map();
 const proxyFailureCounts = new Map();
+
+// Identity key for a proxy entry. Not `proxy.username` - PROXIES entries
+// without credentials (e.g. a self-hosted tinyproxy with no BasicAuth, just
+// "host:port") all end up with username === undefined, which would collide
+// in the Maps below if there were more than one of them.
+function proxyKey(proxy) {
+  return `${proxy.host}:${proxy.port}`;
+}
+
+// Human-readable label for logs - falls back to host:port for credential-less
+// entries (e.g. a self-hosted tinyproxy with no BasicAuth) instead of "undefined".
+function proxyLabel(proxy) {
+  return proxy.username || proxyKey(proxy);
+}
 const lastAlertSentAt = new Map();
 
 // Send an alert to Discord, throttled per `key` so a flapping condition
@@ -101,24 +115,25 @@ function sendDiscordAlert(key, message) {
 // repeatedly are pulled out of rotation immediately instead of waiting for
 // the next scheduled pool-wide health check.
 function recordProxySuccess(proxy) {
-  proxyFailureCounts.delete(proxy.username);
+  proxyFailureCounts.delete(proxyKey(proxy));
 }
 
 function recordProxyFailure(proxy) {
-  const count = (proxyFailureCounts.get(proxy.username) || 0) + 1;
-  proxyFailureCounts.set(proxy.username, count);
+  const key = proxyKey(proxy);
+  const count = (proxyFailureCounts.get(key) || 0) + 1;
+  proxyFailureCounts.set(key, count);
 
   if (count >= PROXY_FAILURE_THRESHOLD) {
-    const idx = czechProxies.findIndex(p => p.username === proxy.username);
+    const idx = czechProxies.findIndex(p => proxyKey(p) === key);
     if (idx !== -1) {
       czechProxies.splice(idx, 1);
-      proxyMiddlewareCache.delete(proxy.username);
-      proxyFailureCounts.delete(proxy.username);
+      proxyMiddlewareCache.delete(key);
+      proxyFailureCounts.delete(key);
       if (currentProxyIndex >= czechProxies.length) currentProxyIndex = 0;
-      log('warn', `[Proxy] Blacklisting ${proxy.username} after ${count} consecutive failures (${czechProxies.length} proxies remain)`);
+      log('warn', `[Proxy] Blacklisting ${proxyLabel(proxy)} after ${count} consecutive failures (${czechProxies.length} proxies remain)`);
 
       if (czechProxies.length === 0) {
-        sendDiscordAlert('pool-empty', `🚨 **Seznam-autobusu proxy**: last Czech proxy (${proxy.username}) was blacklisted after repeated failures - the pool is now empty.`);
+        sendDiscordAlert('pool-empty', `🚨 **Seznam-autobusu proxy**: last Czech proxy (${proxyLabel(proxy)}) was blacklisted after repeated failures - the pool is now empty.`);
       }
     }
   }
@@ -245,7 +260,7 @@ async function checkAllProxies() {
         proxyCheckCurrent = i + j + 1;
 
         if (result.isCzech) {
-          log('info', `[Proxy] ✓ ${proxy.username} is Czech (${result.city}, IP: ${result.ip})`);
+          log('info', `[Proxy] ✓ ${proxyLabel(proxy)} is Czech (${result.city}, IP: ${result.ip})`);
           newCzechProxies.push({
             host: proxy.host,
             port: proxy.port,
@@ -255,9 +270,9 @@ async function checkAllProxies() {
             city: result.city
           });
         } else if (result.error) {
-          log('info', `[Proxy] ✗ ${proxy.username} error: ${result.error}`);
+          log('info', `[Proxy] ✗ ${proxyLabel(proxy)} error: ${result.error}`);
         } else {
-          log('info', `[Proxy] ✗ ${proxy.username} is ${result.country || 'Unknown'}`);
+          log('info', `[Proxy] ✗ ${proxyLabel(proxy)} is ${result.country || 'Unknown'}`);
         }
       });
     }
@@ -842,8 +857,9 @@ function rewriteCss(css, proxyHost) {
 
 // Create proxy middleware for a specific proxy config (cached)
 function getOrCreateProxyMiddleware(proxy) {
-  if (proxyMiddlewareCache.has(proxy.username)) {
-    return proxyMiddlewareCache.get(proxy.username);
+  const key = proxyKey(proxy);
+  if (proxyMiddlewareCache.has(key)) {
+    return proxyMiddlewareCache.get(key);
   }
 
   const proxyUrl = `http://${proxy.username}:${proxy.password}@${proxy.host}:${proxy.port}`;
@@ -941,7 +957,7 @@ function getOrCreateProxyMiddleware(proxy) {
     }
   });
 
-  proxyMiddlewareCache.set(proxy.username, middleware);
+  proxyMiddlewareCache.set(key, middleware);
   return middleware;
 }
 
@@ -978,7 +994,7 @@ function proxyMiddleware(req, res, next) {
   const sessionId = getOrCreateSessionId(req, res);
   const proxy = pickProxyForSession(sessionId);
 
-  log('info', `${req.method} ${req.path} -> ${proxy.username} (${proxy.city}, ${proxy.ip}) [session ${sessionId.slice(0, 8)}]`);
+  log('info', `${req.method} ${req.path} -> ${proxyLabel(proxy)} (${proxy.city}, ${proxy.ip}) [session ${sessionId.slice(0, 8)}]`);
 
   const middleware = getOrCreateProxyMiddleware(proxy);
   middleware(req, res, next);
@@ -1075,5 +1091,7 @@ module.exports._internal = {
   detectLanguage,
   generateWarningPage,
   generateLoadingPage,
-  pickProxyForSession
+  pickProxyForSession,
+  proxyKey,
+  proxyLabel
 };
