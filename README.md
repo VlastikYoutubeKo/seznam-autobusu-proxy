@@ -7,6 +7,15 @@ Reverse proxy for [seznam-autobusu.cz](https://seznam-autobusu.cz) to bypass geo
 - **Project by**: mxnticek ([mxnticek.eu](https://mxnticek.eu) / [cyn.cz](https://cyn.cz))
 - **Created by**: vibecoding (Claude AI)
 
+## Public Instance
+
+The main instance runs at **[seznam.odjezdy.online](https://seznam.odjezdy.online)**,
+using a pool of Czech IPs sourced primarily from [Webshare](https://www.webshare.io/).
+
+If you'd like to support the project - proxies are the main running cost - signing up
+for Webshare through this referral link helps fund the proxy pool:
+[webshare.io/?referral_code=xse6mbni7qbv](https://www.webshare.io/?referral_code=xse6mbni7qbv)
+
 ## Features
 
 - Transparent reverse proxy for seznam-autobusu.cz
@@ -141,7 +150,7 @@ To expose the proxy with SSL using Caddy:
 
 2. **Add configuration**
    ```
-   sez-aut.cyn.cz {
+   your-domain.example {
        reverse_proxy localhost:3000
 
        log {
@@ -217,10 +226,10 @@ Use Chrome DevTools:
 
 | Proxy URL | Original URL | Status |
 |-----------|--------------|--------|
-| `sez-aut.cyn.cz` | `seznam-autobusu.cz` | ✅ Works |
-| `sez-aut.cyn.cz/vuz/663928` | `seznam-autobusu.cz/vuz/663928` | ✅ Works |
-| `sez-aut.cyn.cz/hledat?q=test` | `seznam-autobusu.cz/hledat?q=test` | ✅ Works |
-| `sez-aut.cyn.cz/static/css/style.css` | `seznam-autobusu.cz/static/css/style.css` | ✅ Works |
+| `your-domain.example` | `seznam-autobusu.cz` | ✅ Works |
+| `your-domain.example/vuz/663928` | `seznam-autobusu.cz/vuz/663928` | ✅ Works |
+| `your-domain.example/hledat?q=test` | `seznam-autobusu.cz/hledat?q=test` | ✅ Works |
+| `your-domain.example/static/css/style.css` | `seznam-autobusu.cz/static/css/style.css` | ✅ Works |
 
 All paths, query parameters, and assets are automatically proxied.
 
@@ -333,7 +342,7 @@ claude-proxy-sa/
 
 ## How It Works
 
-1. **User visits proxy URL** (e.g., sez-aut.cyn.cz)
+1. **User visits proxy URL** (e.g., your-domain.example)
 2. **Server detects language** from Accept-Language header
 3. **Warning page shown** in appropriate language (Czech or English)
 4. **User clicks continue** → session cookie set

@@ -1,8 +1,8 @@
 # Caddy Configuration for Seznam-autobusu.cz Proxy
 # Copy this to /etc/caddy/Caddyfile or include it in your main Caddyfile
 
-# Replace sez-aut.cyn.cz with your actual domain
-sez-aut.cyn.cz {
+# Replace your-domain.example with your actual domain
+your-domain.example {
     # Reverse proxy to Node.js server
     reverse_proxy localhost:3000
 
@@ -49,6 +49,6 @@ sez-aut.cyn.cz {
 }
 
 # Optional: Redirect HTTP to HTTPS
-# http://sez-aut.cyn.cz {
+# http://your-domain.example {
 #     redir https://{host}{uri} permanent
 # }

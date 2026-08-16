@@ -817,6 +817,7 @@ function rewriteHtml(html, proxyHost, req) {
           <div class="proxy-support-links">
             <a href="https://ko-fi.com/vlastimilnovotny" target="_blank" class="proxy-support-link">☕ Ko-fi</a>
             <a href="https://donate.odjezdy.online" target="_blank" class="proxy-support-link">🔗 odjezdy.online</a>
+            <a href="https://www.webshare.io/?referral_code=xse6mbni7qbv" target="_blank" class="proxy-support-link">🌐 Webshare</a>
           </div>
         </div>
 
