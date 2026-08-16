@@ -26,7 +26,8 @@ Content-Type: application/json
   "status": "ok",
   "timestamp": "2026-01-09T...",
   "target": "https://seznam-autobusu.cz",
-  "upstreamProxy": "none"
+  "czechProxies": 4,
+  "proxyCheckInProgress": false
 }
 ```
 

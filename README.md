@@ -17,8 +17,13 @@ Reverse proxy for [seznam-autobusu.cz](https://seznam-autobusu.cz) to bypass geo
 - Mobile-responsive design
 - Support for upstream SOCKS5/HTTP proxy
 - Docker containerization ready
-- Health check endpoint
-- Rate limiting and security headers
+- Health check, proxy-status, and Prometheus-style `/metrics` endpoints
+- Rate limiting and security headers (real CSP, not disabled)
+- Sticky per-session proxy assignment (a given visitor keeps the same upstream IP)
+- Automatic proxy health scoring - repeatedly failing proxies are pulled from rotation immediately
+- Parallelized proxy pool health checks
+- Optional Discord webhook alert when the Czech proxy pool is empty
+- Graceful shutdown on SIGTERM/SIGINT (Docker-friendly)
 - All paths and query parameters preserved
 - Forms work correctly through proxy
 
@@ -166,9 +171,18 @@ Expected response:
   "status": "ok",
   "timestamp": "2026-01-09T...",
   "target": "https://seznam-autobusu.cz",
-  "upstreamProxy": "configured" or "none"
+  "czechProxies": 4,
+  "proxyCheckInProgress": false
 }
 ```
+
+### Test Metrics
+```bash
+curl http://localhost:3000/metrics
+```
+
+Prometheus-style text output with request counts, proxy errors, rate-limit
+rejections, and the current Czech proxy pool size.
 
 ### Test Warning Page (Czech)
 ```bash
@@ -218,8 +232,9 @@ All paths, query parameters, and assets are automatically proxied.
 |----------|-------------|----------|---------|
 | `PORT` | Server port | No | 3000 |
 | `NODE_ENV` | Environment | No | production |
-| `COOKIE_SECRET` | Cookie signing secret | No | auto-generated |
+| `COOKIE_SECRET` | Cookie signing secret. If left at the default with `NODE_ENV=production`, the server refuses to start. | No (yes in production) | auto-generated |
 | `UPSTREAM_PROXY` | Upstream proxy URL | No | none |
+| `DISCORD_WEBHOOK_URL` | Discord webhook for pool-empty alerts (throttled to 1/15min) | No | none |
 
 ### Upstream Proxy Format
 
@@ -292,15 +307,22 @@ docker-compose logs
 - The warning page clearly states NOT to enter login credentials
 - Proxy only displays public content
 - No login functionality should be used through the proxy
-- Rate limiting prevents abuse (100 requests per minute per IP)
-- Security headers enabled via Helmet.js
+- Rate limiting prevents abuse (100 requests per minute per IP, based on the
+  real client IP via `trust proxy` when running behind Caddy)
+- Security headers enabled via Helmet.js, including a real (if permissive)
+  Content-Security-Policy - needed because we're transparently serving a
+  third-party site's own scripts/styles under our origin
 - Cookies are signed and HTTP-only
+- Upstream `Set-Cookie` and redirect (`Location`) headers are rewritten so
+  the real seznam-autobusu.cz domain never leaks to the browser
 
 ## Project Structure
 
 ```
 claude-proxy-sa/
 ├── server.js              # Main proxy server
+├── __tests__/             # Jest + Supertest test suite
+├── .github/workflows/     # CI (runs npm test on push/PR)
 ├── package.json           # Dependencies
 ├── Dockerfile             # Container build
 ├── docker-compose.yml     # Container orchestration
@@ -330,6 +352,18 @@ npm run dev
 
 # The server will restart automatically on file changes
 ```
+
+## Automated Tests
+
+```bash
+npm test
+```
+
+Runs the Jest + Supertest suite in `__tests__/` (URL/HTML/CSS rewriting, language
+detection, cookie-domain stripping, `/health`, `/metrics`, `/accept-warning`, and
+rate limiting). Tests don't hit the network or bind a real port - `checkAllProxies()`
+and `app.listen()` only run when the file is executed directly, not when required
+as a module. CI runs this suite on every push via `.github/workflows/ci.yml`.
 
 ## License
 

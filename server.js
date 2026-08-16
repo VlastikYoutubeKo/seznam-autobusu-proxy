@@ -11,6 +11,7 @@ const fs = require('fs');
 const zlib = require('zlib');
 const https = require('https');
 const http = require('http');
+const crypto = require('crypto');
 const apicache = require('apicache');
 
 require('dotenv').config()
@@ -18,18 +19,110 @@ require('dotenv').config()
 // Configuration
 const PORT = process.env.PORT || 3000;
 const TARGET_URL = 'https://seznam-autobusu.cz';
-const COOKIE_SECRET = process.env.COOKIE_SECRET || 'seznam-proxy-secret-key';
+const DEFAULT_COOKIE_SECRET = 'seznam-proxy-secret-key';
+const COOKIE_SECRET = process.env.COOKIE_SECRET || DEFAULT_COOKIE_SECRET;
 const WARNING_COOKIE = 'seznam_proxy_warned';
+const SESSION_COOKIE = 'seznam_proxy_session_id';
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const IS_TEST = process.env.NODE_ENV === 'test';
+
+// Simple leveled/timestamped logger
+function log(level, ...args) {
+  const ts = new Date().toISOString();
+  const fn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
+  fn(`[${ts}] [${level.toUpperCase()}]`, ...args);
+}
+
+// Validate critical environment configuration at startup
+function validateEnv() {
+  const usesDefaultSecret = !process.env.COOKIE_SECRET ||
+    process.env.COOKIE_SECRET === DEFAULT_COOKIE_SECRET ||
+    process.env.COOKIE_SECRET === 'your-secret-key-here-change-me';
+
+  if (usesDefaultSecret) {
+    if (IS_PRODUCTION) {
+      log('error', 'COOKIE_SECRET is not set (or left at its default placeholder) while NODE_ENV=production. Refusing to start with an insecure secret.');
+      process.exit(1);
+    } else if (!IS_TEST) {
+      log('warn', 'COOKIE_SECRET is not set - using an insecure default. Set COOKIE_SECRET in .env before deploying to production.');
+    }
+  }
+}
+
+validateEnv();
 
 // Proxy configuration
 const PROXY_CHECK_INTERVAL = 2 * 60 * 60 * 1000; // 2 hours
 const PROXY_CHECK_TIMEOUT = 15000; // 15 seconds
+const PROXY_CHECK_CONCURRENCY = 10;
+const PROXY_FAILURE_THRESHOLD = 5;
+const ALERT_COOLDOWN = 15 * 60 * 1000; // 15 minutes
 
 // Czech proxy pool
 let czechProxies = [];
 let currentProxyIndex = 0;
 let proxyCheckInProgress = false;
 const proxyMiddlewareCache = new Map();
+const proxyFailureCounts = new Map();
+const lastAlertSentAt = new Map();
+
+// Send an alert to Discord, throttled per `key` so a flapping condition
+// doesn't spam the webhook.
+function sendDiscordAlert(key, message) {
+  const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+  if (!webhookUrl || IS_TEST) return;
+
+  const now = Date.now();
+  const last = lastAlertSentAt.get(key) || 0;
+  if (now - last < ALERT_COOLDOWN) return;
+  lastAlertSentAt.set(key, now);
+
+  try {
+    const url = new URL(webhookUrl);
+    const payload = JSON.stringify({ content: message });
+    const req = https.request({
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    }, (res) => { res.on('data', () => {}); res.on('end', () => {}); });
+    req.on('error', (err) => log('error', '[Alert] Failed to send Discord webhook:', err.message));
+    req.write(payload);
+    req.end();
+  } catch (err) {
+    log('error', '[Alert] Failed to send Discord webhook:', err.message);
+  }
+}
+
+// Record the outcome of a request through a given proxy. Proxies that fail
+// repeatedly are pulled out of rotation immediately instead of waiting for
+// the next scheduled pool-wide health check.
+function recordProxySuccess(proxy) {
+  proxyFailureCounts.delete(proxy.username);
+}
+
+function recordProxyFailure(proxy) {
+  const count = (proxyFailureCounts.get(proxy.username) || 0) + 1;
+  proxyFailureCounts.set(proxy.username, count);
+
+  if (count >= PROXY_FAILURE_THRESHOLD) {
+    const idx = czechProxies.findIndex(p => p.username === proxy.username);
+    if (idx !== -1) {
+      czechProxies.splice(idx, 1);
+      proxyMiddlewareCache.delete(proxy.username);
+      proxyFailureCounts.delete(proxy.username);
+      if (currentProxyIndex >= czechProxies.length) currentProxyIndex = 0;
+      log('warn', `[Proxy] Blacklisting ${proxy.username} after ${count} consecutive failures (${czechProxies.length} proxies remain)`);
+
+      if (czechProxies.length === 0) {
+        sendDiscordAlert('pool-empty', `🚨 **Seznam-autobusu proxy**: last Czech proxy (${proxy.username}) was blacklisted after repeated failures - the pool is now empty.`);
+      }
+    }
+  }
+}
 
 // Fetch proxy list from environment variable and Webshare
 async function fetchProxyList() {
@@ -57,7 +150,7 @@ async function fetchProxyList() {
           res.on('data', chunk => data += chunk);
           res.on('end', () => {
             if (res.statusCode !== 200) {
-               console.warn(`[Proxy] Failed to fetch Webshare proxies: Status ${res.statusCode}`);
+               log('warn', `[Proxy] Failed to fetch Webshare proxies: Status ${res.statusCode}`);
                return resolve([]);
             }
             const proxies = data.trim().split('\n').map(line => {
@@ -73,12 +166,12 @@ async function fetchProxyList() {
       });
       proxyList = proxyList.concat(webshareProxies);
     } catch (e) {
-      console.warn(`[Proxy] Error fetching from WEBSHARE_PROXY_URL: ${e.message}`);
+      log('warn', `[Proxy] Error fetching from WEBSHARE_PROXY_URL: ${e.message}`);
     }
   }
 
   if (proxyList.length === 0) {
-    console.warn('[Proxy] No proxies defined in PROXIES or WEBSHARE_PROXY_URL environment variables.');
+    log('warn', '[Proxy] No proxies defined in PROXIES or WEBSHARE_PROXY_URL environment variables.');
   }
 
   return proxyList;
@@ -125,61 +218,67 @@ async function checkProxyCountry(proxy) {
   });
 }
 
-// Check all proxies and find Czech ones
+// Check all proxies (in parallel batches) and find the Czech ones
 async function checkAllProxies() {
   if (proxyCheckInProgress) {
-    console.log('[Proxy] Check already in progress, skipping...');
+    log('info', '[Proxy] Check already in progress, skipping...');
     return;
   }
 
   proxyCheckInProgress = true;
-  console.log(`[Proxy] Starting proxy check at ${new Date().toISOString()}`);
+  log('info', `[Proxy] Starting proxy check`);
 
   try {
     const proxies = await fetchProxyList();
-    console.log(`[Proxy] Fetched ${proxies.length} proxies from sources`);
+    log('info', `[Proxy] Fetched ${proxies.length} proxies from sources`);
     proxyCheckTotal = proxies.length;
     proxyCheckCurrent = 0;
 
     const newCzechProxies = [];
 
-    for (let i = 0; i < proxies.length; i++) {
-      proxyCheckCurrent = i + 1;
-      const proxy = proxies[i];
-      console.log(`[Proxy] Checking ${proxy.username} (${i + 1}/${proxies.length})...`);
+    for (let i = 0; i < proxies.length; i += PROXY_CHECK_CONCURRENCY) {
+      const batch = proxies.slice(i, i + PROXY_CHECK_CONCURRENCY);
+      const results = await Promise.all(batch.map(proxy => checkProxyCountry(proxy)));
 
-      const result = await checkProxyCountry(proxy);
+      results.forEach((result, j) => {
+        const proxy = batch[j];
+        proxyCheckCurrent = i + j + 1;
 
-      if (result.isCzech) {
-        console.log(`[Proxy] ✓ ${proxy.username} is Czech (${result.city}, IP: ${result.ip})`);
-        newCzechProxies.push({
-          host: proxy.host,
-          port: proxy.port,
-          username: proxy.username,
-          password: proxy.password,
-          ip: result.ip,
-          city: result.city
-        });
-      } else if (result.error) {
-        console.log(`[Proxy] ✗ ${proxy.username} error: ${result.error}`);
-      } else {
-        console.log(`[Proxy] ✗ ${proxy.username} is ${result.country || 'Unknown'}`);
-      }
+        if (result.isCzech) {
+          log('info', `[Proxy] ✓ ${proxy.username} is Czech (${result.city}, IP: ${result.ip})`);
+          newCzechProxies.push({
+            host: proxy.host,
+            port: proxy.port,
+            username: proxy.username,
+            password: proxy.password,
+            ip: result.ip,
+            city: result.city
+          });
+        } else if (result.error) {
+          log('info', `[Proxy] ✗ ${proxy.username} error: ${result.error}`);
+        } else {
+          log('info', `[Proxy] ✗ ${proxy.username} is ${result.country || 'Unknown'}`);
+        }
+      });
     }
 
     if (newCzechProxies.length > 0) {
       czechProxies = newCzechProxies;
       currentProxyIndex = 0;
       proxyMiddlewareCache.clear(); // Clear cache when proxies change
-      console.log(`[Proxy] ========================================`);
-      console.log(`[Proxy] Found ${czechProxies.length} Czech proxies`);
-      console.log(`[Proxy] ========================================`);
+      proxyFailureCounts.clear();
+      log('info', `[Proxy] ========================================`);
+      log('info', `[Proxy] Found ${czechProxies.length} Czech proxies`);
+      log('info', `[Proxy] ========================================`);
     } else {
-      console.log(`[Proxy] No Czech proxies found, keeping existing ${czechProxies.length} proxies`);
+      log('warn', `[Proxy] No Czech proxies found, keeping existing ${czechProxies.length} proxies`);
+      if (czechProxies.length === 0) {
+        sendDiscordAlert('pool-empty', `🚨 **Seznam-autobusu proxy**: no Czech proxies available. Checked ${proxies.length} proxies, none passed. The server cannot serve traffic.`);
+      }
     }
 
   } catch (error) {
-    console.error('[Proxy] Error checking proxies:', error.message);
+    log('error', '[Proxy] Error checking proxies:', error.message);
   } finally {
     proxyCheckInProgress = false;
   }
@@ -211,23 +310,63 @@ function getCurrentProxyInfo() {
 // Initialize Express app
 const app = express();
 
+// Trust the reverse proxy in front of us (e.g. Caddy) so req.ip reflects the
+// real client instead of the upstream hop - affects rate limiting accuracy.
+app.set('trust proxy', 1);
+
+// Metrics (simple in-memory counters, exposed via /metrics)
+const metrics = {
+  requestsTotal: 0,
+  requestsByStatus: {},
+  proxyErrorsTotal: 0,
+  rateLimitedTotal: 0
+};
+
 // Middleware
 app.use(compression());
 app.use(helmet({
-  contentSecurityPolicy: false,
-  crossOriginEmbedderPolicy: false
+  // We're transparently proxying a third-party site's HTML/CSS/JS under our
+  // own origin, so a strict default-src would break it. Still worth setting
+  // real directives (instead of `false`) for the protections that don't
+  // depend on knowing the upstream's asset hosts in advance.
+  contentSecurityPolicy: {
+    useDefaults: false,
+    directives: {
+      defaultSrc: ["'self'", '*'],
+      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", '*'],
+      styleSrc: ["'self'", "'unsafe-inline'", '*'],
+      imgSrc: ["'self'", 'data:', 'blob:', '*'],
+      fontSrc: ["'self'", 'data:', '*'],
+      connectSrc: ["'self'", '*'],
+      objectSrc: ["'none'"],
+      frameAncestors: ["'self'"],
+      upgradeInsecureRequests: []
+    }
+  },
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: false
 }));
 app.use(cookieParser(COOKIE_SECRET));
 
+app.use((req, res, next) => {
+  metrics.requestsTotal++;
+  res.on('finish', () => {
+    const code = res.statusCode;
+    metrics.requestsByStatus[code] = (metrics.requestsByStatus[code] || 0) + 1;
+  });
+  next();
+});
+
 // Simple rate limiting
 const requestCounts = new Map();
-setInterval(() => requestCounts.clear(), 60000); // Reset every minute
+setInterval(() => requestCounts.clear(), 60000).unref(); // Reset every minute
 
 const rateLimiter = (req, res, next) => {
   const ip = req.ip || req.connection.remoteAddress;
   const count = requestCounts.get(ip) || 0;
 
   if (count > 100) {
+    metrics.rateLimitedTotal++;
     return res.status(429).send('Too many requests. Please try again later.');
   }
 
@@ -377,6 +516,40 @@ app.get('/proxy-check-progress', (req, res) => {
   });
 });
 
+// Prometheus-style metrics endpoint
+app.get('/metrics', (req, res) => {
+  res.set('Content-Type', 'text/plain; version=0.0.4');
+  const statusLines = Object.entries(metrics.requestsByStatus)
+    .map(([code, count]) => `seznam_proxy_requests_by_status_total{status="${code}"} ${count}`)
+    .join('\n');
+
+  res.send(
+`# HELP seznam_proxy_requests_total Total HTTP requests received
+# TYPE seznam_proxy_requests_total counter
+seznam_proxy_requests_total ${metrics.requestsTotal}
+
+# HELP seznam_proxy_requests_by_status_total Total HTTP requests by response status code
+# TYPE seznam_proxy_requests_by_status_total counter
+${statusLines}
+
+# HELP seznam_proxy_rate_limited_total Total requests rejected by the rate limiter
+# TYPE seznam_proxy_rate_limited_total counter
+seznam_proxy_rate_limited_total ${metrics.rateLimitedTotal}
+
+# HELP seznam_proxy_errors_total Total upstream proxy errors
+# TYPE seznam_proxy_errors_total counter
+seznam_proxy_errors_total ${metrics.proxyErrorsTotal}
+
+# HELP seznam_proxy_czech_proxies Current number of healthy Czech proxies in the pool
+# TYPE seznam_proxy_czech_proxies gauge
+seznam_proxy_czech_proxies ${czechProxies.length}
+
+# HELP seznam_proxy_check_in_progress Whether a proxy pool health check is currently running
+# TYPE seznam_proxy_check_in_progress gauge
+seznam_proxy_check_in_progress ${proxyCheckInProgress ? 1 : 0}
+`);
+});
+
 // Proxy status endpoint
 app.get('/proxy-status', (req, res) => {
   res.status(200).json({
@@ -392,7 +565,7 @@ app.get('/proxy-status', (req, res) => {
   });
 });
 
-// URL rewriting helper
+// URL rewriting helper - rewrites a value that IS a URL (href/src/action/...)
 function rewriteUrl(url, proxyHost) {
   if (!url) return url;
 
@@ -407,6 +580,24 @@ function rewriteUrl(url, proxyHost) {
   }
 
   return url;
+}
+
+// Rewrites any occurrences of the target domain inside a larger string, e.g.
+// meta-refresh content ("5;url=https://seznam-autobusu.cz/foo") or a Location
+// header, where the value isn't itself purely a URL so rewriteUrl's
+// startsWith checks would never match.
+function rewriteUrlsInText(text, proxyHost) {
+  if (!text) return text;
+  return text
+    .replace(/https?:\/\/seznam-autobusu\.cz/g, `https://${proxyHost}`)
+    .replace(/\/\/seznam-autobusu\.cz/g, `//${proxyHost}`);
+}
+
+// Removes the Domain= attribute from a Set-Cookie header value, so the
+// browser scopes the cookie to whichever host actually set it (us) instead
+// of the upstream's real domain, which it would otherwise reject/ignore.
+function stripCookieDomain(cookie) {
+  return cookie.replace(/;\s*Domain=[^;]+/i, '');
 }
 
 // HTML rewriting function
@@ -443,11 +634,34 @@ function rewriteHtml(html, proxyHost, req) {
     $(elem).attr('href', rewriteUrl(href, proxyHost));
   });
 
-  // Rewrite meta tags
+  // Rewrite srcset (responsive images: "url widthdescriptor, url2 widthdescriptor")
+  $('[srcset]').each((i, elem) => {
+    const srcset = $(elem).attr('srcset');
+    if (!srcset) return;
+    const rewritten = srcset.split(',').map(part => {
+      const trimmed = part.trim();
+      if (!trimmed) return trimmed;
+      const spaceIdx = trimmed.indexOf(' ');
+      if (spaceIdx === -1) return rewriteUrl(trimmed, proxyHost);
+      return rewriteUrl(trimmed.slice(0, spaceIdx), proxyHost) + trimmed.slice(spaceIdx);
+    }).join(', ');
+    $(elem).attr('srcset', rewritten);
+  });
+
+  // Rewrite inline style="...url(...)" attributes
+  $('[style]').each((i, elem) => {
+    const style = $(elem).attr('style');
+    if (style && style.includes('url(')) {
+      $(elem).attr('style', rewriteCss(style, proxyHost));
+    }
+  });
+
+  // Rewrite meta tags - content isn't always a bare URL (e.g. meta-refresh's
+  // "5;url=https://..."), so scan/replace anywhere in the string.
   $('meta[content]').each((i, elem) => {
     const content = $(elem).attr('content');
     if (content && content.includes('seznam-autobusu.cz')) {
-      $(elem).attr('content', rewriteUrl(content, proxyHost));
+      $(elem).attr('content', rewriteUrlsInText(content, proxyHost));
     }
   });
 
@@ -647,8 +861,25 @@ function getOrCreateProxyMiddleware(proxy) {
       const contentType = proxyRes.headers['content-type'] || '';
       const encoding = proxyRes.headers['content-encoding'];
 
+      if (proxyRes.statusCode >= 500) {
+        recordProxyFailure(proxy);
+      } else {
+        recordProxySuccess(proxy);
+      }
+
       delete proxyRes.headers['content-security-policy'];
       delete proxyRes.headers['x-frame-options'];
+
+      // Redirects from the upstream would otherwise leak the real domain
+      if (proxyRes.headers['location']) {
+        proxyRes.headers['location'] = rewriteUrlsInText(proxyRes.headers['location'], proxyHost);
+      }
+
+      // Cookies set with a Domain= attribute for seznam-autobusu.cz won't be
+      // honored by the browser under our domain.
+      if (proxyRes.headers['set-cookie']) {
+        proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(stripCookieDomain);
+      }
 
       Object.keys(proxyRes.headers).forEach(key => {
         res.setHeader(key, proxyRes.headers[key]);
@@ -696,10 +927,13 @@ function getOrCreateProxyMiddleware(proxy) {
       }
     },
     onError: (err, req, res) => {
+      metrics.proxyErrorsTotal++;
+      recordProxyFailure(proxy);
+
       if (['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EPIPE'].includes(err.code)) {
         return;
       }
-      console.error('Proxy error:', err.message);
+      log('error', 'Proxy error:', err.message);
       if (!res.headersSent) {
         res.status(502).send('Proxy error: Unable to reach seznam-autobusu.cz. Please try again later.');
       }
@@ -710,16 +944,40 @@ function getOrCreateProxyMiddleware(proxy) {
   return middleware;
 }
 
+// Assigns each browser a stable per-session id, so a given visitor keeps
+// hitting the same upstream Czech proxy instead of a different IP on every
+// single request (which can look suspicious to the target site).
+function getOrCreateSessionId(req, res) {
+  let sessionId = req.cookies[SESSION_COOKIE];
+  if (!sessionId || !/^[a-f0-9]{32}$/.test(sessionId)) {
+    sessionId = crypto.randomBytes(16).toString('hex');
+    res.cookie(SESSION_COOKIE, sessionId, {
+      maxAge: 24 * 60 * 60 * 1000,
+      httpOnly: true,
+      sameSite: 'lax'
+    });
+  }
+  return sessionId;
+}
+
+// Deterministically maps a session id to one of the currently healthy proxies.
+function pickProxyForSession(sessionId) {
+  if (czechProxies.length === 0) return null;
+  const hash = crypto.createHash('md5').update(sessionId).digest();
+  const index = hash.readUInt32BE(0) % czechProxies.length;
+  return czechProxies[index];
+}
+
 // Dynamic proxy handler
 function proxyMiddleware(req, res, next) {
   if (czechProxies.length === 0) {
     return res.status(503).send('No Czech proxies available.');
   }
 
-  const proxy = czechProxies[currentProxyIndex];
-  currentProxyIndex = (currentProxyIndex + 1) % czechProxies.length;
+  const sessionId = getOrCreateSessionId(req, res);
+  const proxy = pickProxyForSession(sessionId);
 
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} -> ${proxy.username} (${proxy.city}, ${proxy.ip})`);
+  log('info', `${req.method} ${req.path} -> ${proxy.username} (${proxy.city}, ${proxy.ip}) [session ${sessionId.slice(0, 8)}]`);
 
   const middleware = getOrCreateProxyMiddleware(proxy);
   middleware(req, res, next);
@@ -734,8 +992,9 @@ const cacheMiddleware = apicache.middleware('5 minutes', (req, res) => res.statu
 
 // Main proxy handler with warning page check
 app.use((req, res, next) => {
-  // Skip warning for health check, accept-warning, and proxy-status
-  if (req.path === '/health' || req.path === '/accept-warning' || req.path === '/proxy-status') {
+  // Skip warning for health check, accept-warning, proxy-status, metrics, and progress polling
+  if (req.path === '/health' || req.path === '/accept-warning' || req.path === '/proxy-status' ||
+      req.path === '/metrics' || req.path === '/proxy-check-progress') {
     return next();
   }
 
@@ -764,23 +1023,56 @@ app.use((req, res, next) => {
   });
 });
 
-// Start server
-app.listen(PORT, async () => {
-  console.log('==========================================');
-  console.log('Seznam-autobusu.cz Proxy Server');
-  console.log('==========================================');
-  console.log(`Port: ${PORT}`);
-  console.log(`Target: ${TARGET_URL}`);
-  console.log(`Health Check: http://localhost:${PORT}/health`);
-  console.log(`Proxy Status: http://localhost:${PORT}/proxy-status`);
-  console.log('==========================================');
-  console.log('Server started. Checking for Czech proxies...');
-  console.log('==========================================');
+// Only actually bind a port / hit the network when run directly (`node
+// server.js`), not when required as a module by the test suite.
+if (require.main === module) {
+  const server = app.listen(PORT, async () => {
+    console.log('==========================================');
+    console.log('Seznam-autobusu.cz Proxy Server');
+    console.log('==========================================');
+    console.log(`Port: ${PORT}`);
+    console.log(`Target: ${TARGET_URL}`);
+    console.log(`Health Check: http://localhost:${PORT}/health`);
+    console.log(`Proxy Status: http://localhost:${PORT}/proxy-status`);
+    console.log(`Metrics: http://localhost:${PORT}/metrics`);
+    console.log('==========================================');
+    console.log('Server started. Checking for Czech proxies...');
+    console.log('==========================================');
 
-  // Initial proxy check
-  await checkAllProxies();
+    // Initial proxy check
+    await checkAllProxies();
 
-  // Schedule proxy checks every 2 hours
-  setInterval(checkAllProxies, PROXY_CHECK_INTERVAL);
-  console.log(`[Proxy] Next check scheduled in 2 hours`);
-});
+    // Schedule proxy checks every 2 hours
+    setInterval(checkAllProxies, PROXY_CHECK_INTERVAL);
+    log('info', `[Proxy] Next check scheduled in 2 hours`);
+  });
+
+  function shutdown(signal) {
+    log('info', `[Server] Received ${signal}, shutting down gracefully...`);
+    server.close(() => {
+      log('info', '[Server] HTTP server closed.');
+      process.exit(0);
+    });
+    // Don't hang forever if a connection never closes
+    setTimeout(() => {
+      log('error', '[Server] Forced shutdown after timeout.');
+      process.exit(1);
+    }, 10000).unref();
+  }
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+}
+
+module.exports = app;
+module.exports._internal = {
+  rewriteUrl,
+  rewriteUrlsInText,
+  rewriteHtml,
+  rewriteCss,
+  stripCookieDomain,
+  detectLanguage,
+  generateWarningPage,
+  generateLoadingPage,
+  pickProxyForSession
+};
