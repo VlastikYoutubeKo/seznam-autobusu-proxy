@@ -22,7 +22,7 @@ This project is a Node.js-based reverse proxy designed to bypass geographical re
 - `package.json`: Defines project metadata, dependencies, and npm scripts.
 - `Dockerfile` & `docker-compose.yml`: Configuration for building and running the application within Docker containers.
 - `views/warning.html`: The HTML template used for the initial warning page, populated dynamically by `server.js`.
-- `.env.example`: Template for environment variables (e.g., `PORT`, `COOKIE_SECRET`, `UPSTREAM_PROXY`).
+- `.env.example`: Template for environment variables (e.g., `PORT`, `COOKIE_SECRET`, `PROXIES`, `WEBSHARE_PROXY_URL`, `DISCORD_WEBHOOK_URL`). Note: `UPSTREAM_PROXY` is documented there but not actually read by `server.js` - a leftover from an earlier design.
 
 ## Building and Running
 

@@ -209,15 +209,18 @@ done | tail -20
 - First 100 requests: `200 OK`
 - Requests 101+: `429 Too Many Requests`
 
-## 9. Upstream Proxy Tests
+## 9. Czech Proxy Pool Tests
 
-Only if using upstream proxy configuration.
+`UPSTREAM_PROXY` is not read anywhere in `server.js` (leftover from an earlier
+design) - the actual mechanism is the `PROXIES`/`WEBSHARE_PROXY_URL` pool.
 
-### 9.1 Configure Upstream Proxy
+### 9.1 Configure the Pool
 
 Edit `.env`:
 ```env
-UPSTREAM_PROXY=socks5://user:pass@proxy.example.com:1080
+PROXIES=proxy1.example.com:1080:user1:pass1,proxy2.example.com:1080:user2:pass2
+# and/or
+WEBSHARE_PROXY_URL=https://proxy.webshare.io/api/v2/proxy/list/download/<token>/-/any/username/backbone/-/
 ```
 
 Restart server:
@@ -227,24 +230,23 @@ docker-compose restart
 npm start
 ```
 
-### 9.2 Verify Proxy Connection
+### 9.2 Verify Proxies Were Found
 
 ```bash
 curl http://localhost:3000/health
+curl http://localhost:3000/proxy-status
 ```
 
-**Expected Result:**
-```json
-{
-  "upstreamProxy": "configured"
-}
-```
+**Expected Result:** `/health` shows `"status": "ok"` and `"czechProxies" > 0`
+once the startup health check finishes (`"proxyCheckInProgress": false`).
+`/proxy-status` lists each Czech proxy's username, IP, and city.
 
 ### 9.3 Test Proxied Content
 
 1. Accept warning
 2. Navigate to any page
-3. **Expected:** Content loads through upstream proxy
+3. **Expected:** Content loads through one of the pool's Czech proxies (see
+   server logs for `... -> <username> (<city>, <ip>) [session ...]`)
 
 ## 10. Error Handling Tests
 
@@ -254,11 +256,12 @@ curl http://localhost:3000/health
 2. Try to access proxy
 3. **Expected:** Error message: "Proxy error: Unable to reach seznam-autobusu.cz"
 
-### 10.2 Invalid Upstream Proxy
+### 10.2 Invalid Proxy Entries
 
-1. Configure invalid upstream proxy in `.env`
+1. Add a bad entry to `PROXIES` in `.env` (wrong port/credentials)
 2. Restart server
-3. **Expected:** Error logged, but server still starts
+3. **Expected:** That entry fails its Czech-IP check and is logged/skipped;
+   the server still starts and uses whatever other proxies did pass
 
 ## 11. Security Tests
 
@@ -384,7 +387,7 @@ Copy and check off as you test:
 - [ ] Rate limiting works (429 after 100 requests)
 - [ ] Docker build succeeds
 - [ ] Docker container runs healthy
-- [ ] Upstream proxy works (if configured)
+- [ ] Czech proxy pool populates (`/health` shows `czechProxies > 0`)
 - [ ] Forms submit correctly
 - [ ] Compression enabled
 - [ ] Security headers present

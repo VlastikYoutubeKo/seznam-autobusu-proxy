@@ -50,21 +50,16 @@ The warning clearly states:
 
 ## Deployment Scenarios
 
-### Scenario 1: Home Server (Czech IP)
+Every request is proxied through a Czech IP from the `PROXIES`/`WEBSHARE_PROXY_URL`
+pool - there's no direct-connection path, so **this is required regardless of
+where you host the server**, even if the server itself already has a Czech IP:
 
-If your server is located in Czech Republic with a Czech IP address:
-
-1. No upstream proxy needed
-2. Direct connection to seznam-autobusu.cz
-3. Leave `UPSTREAM_PROXY` empty in `.env`
-
-### Scenario 2: VPS (Outside Czech Republic)
-
-If your server is in Germany or elsewhere:
-
-1. Requires upstream Czech SOCKS5/HTTP proxy
-2. Configure `UPSTREAM_PROXY` in `.env`
-3. Example: `UPSTREAM_PROXY=socks5://user:pass@czech-proxy.com:1080`
+1. Set `PROXIES` and/or `WEBSHARE_PROXY_URL` in `.env` (see [Configuration](#environment-variables))
+2. On startup (and every 2 hours after), the server fetches those candidates,
+   checks each one's IP via ip-api.com, and keeps only the ones that come
+   back as Czech (`CZ`)
+3. The server won't serve real traffic until at least one Czech proxy passes -
+   `/health` returns `"status": "no_proxies"` until then
 
 ## Installation
 
@@ -72,7 +67,8 @@ If your server is in Germany or elsewhere:
 
 - Node.js 18+ and npm 9+
 - Docker and Docker Compose (optional)
-- Upstream Czech proxy (only for VPS scenario)
+- At least one working proxy with a Czech IP (via `PROXIES` and/or
+  `WEBSHARE_PROXY_URL` - see [Deployment Scenarios](#deployment-scenarios))
 
 ### Method 1: Docker (Recommended)
 
@@ -95,8 +91,9 @@ If your server is in Germany or elsewhere:
    NODE_ENV=production
    COOKIE_SECRET=your-random-secret-key-here
 
-   # Only if outside Czech Republic:
-   # UPSTREAM_PROXY=socks5://user:pass@proxy.example.com:1080
+   # At least one of these is required (see Deployment Scenarios):
+   PROXIES=proxy1.example.com:1080:user1:pass1,proxy2.example.com:1080:user2:pass2
+   # WEBSHARE_PROXY_URL=https://proxy.webshare.io/api/v2/proxy/list/download/<token>/-/any/username/backbone/-/
    ```
 
 3. **Build and start**
@@ -242,20 +239,12 @@ All paths, query parameters, and assets are automatically proxied.
 | `PORT` | Server port | No | 3000 |
 | `NODE_ENV` | Environment | No | production |
 | `COOKIE_SECRET` | Cookie signing secret. If left at the default with `NODE_ENV=production`, the server refuses to start. | No (yes in production) | auto-generated |
-| `UPSTREAM_PROXY` | Upstream proxy URL | No | none |
+| `PROXIES` | Comma-separated `host:port:user:pass` list of candidate proxies (any provider). Checked for a Czech IP and added to the rotation pool. | No* | none |
+| `WEBSHARE_PROXY_URL` | Webshare's pre-authenticated proxy list "download" URL - merged with `PROXIES` on every health check. | No* | none |
 | `DISCORD_WEBHOOK_URL` | Discord webhook for pool-empty alerts (throttled to 1/15min) | No | none |
+| `UPSTREAM_PROXY` | ⚠️ Not currently read anywhere in `server.js` - leftover from an earlier single-upstream-proxy design, superseded by the `PROXIES`/`WEBSHARE_PROXY_URL` pool above. Setting it does nothing right now. | No | none |
 
-### Upstream Proxy Format
-
-**HTTP Proxy:**
-```
-UPSTREAM_PROXY=http://username:password@proxy.example.com:8080
-```
-
-**SOCKS5 Proxy:**
-```
-UPSTREAM_PROXY=socks5://username:password@proxy.example.com:1080
-```
+\* At least one of `PROXIES` or `WEBSHARE_PROXY_URL` is required for the proxy to actually serve traffic - the pool of Czech IPs sourced from these is what every request rotates/sticks through (see [Public Instance](#public-instance) above for how the reference deployment configures this).
 
 ## Docker Commands
 
