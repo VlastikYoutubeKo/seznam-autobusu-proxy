@@ -61,6 +61,31 @@ where you host the server**, even if the server itself already has a Czech IP:
 3. The server won't serve real traffic until at least one Czech proxy passes -
    `/health` returns `"status": "no_proxies"` until then
 
+### Self-hosted alternative: tinyproxy
+
+You don't need a paid provider like Webshare - if you have any machine with a
+Czech IP (a home server, a Raspberry Pi, a cheap Czech VPS), you can run
+[tinyproxy](https://tinyproxy.github.io/) on it as your own entry in `PROXIES`:
+
+```bash
+# On the Czech machine
+sudo apt install tinyproxy
+sudo nano /etc/tinyproxy/tinyproxy.conf
+```
+
+In `tinyproxy.conf`, set a port, require auth, and restrict `Allow` to just
+this server's IP so it isn't an open relay for anyone else on the internet:
+```
+Port 8888
+BasicAuth myuser mypassword
+Allow <this-proxy-server-ip>/32
+```
+
+Then on this server, add it to `.env` alongside/instead of Webshare:
+```env
+PROXIES=czech-machine-ip:8888:myuser:mypassword
+```
+
 ## Installation
 
 ### Prerequisites
