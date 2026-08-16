@@ -1,0 +1,54 @@
+# Caddy Configuration for Seznam-autobusu.cz Proxy
+# Copy this to /etc/caddy/Caddyfile or include it in your main Caddyfile
+
+# Replace sez-aut.cyn.cz with your actual domain
+sez-aut.cyn.cz {
+    # Reverse proxy to Node.js server
+    reverse_proxy localhost:3000
+
+    # Logging
+    log {
+        output file /var/log/caddy/seznam-autobusu-proxy.log {
+            roll_size 10mb
+            roll_keep 5
+            roll_keep_for 720h
+        }
+        format json
+        level INFO
+    }
+
+    # Compression
+    encode gzip zstd
+
+    # Security headers
+    header {
+        # Enable HSTS
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+
+        # Prevent clickjacking
+        X-Frame-Options "SAMEORIGIN"
+
+        # Prevent MIME type sniffing
+        X-Content-Type-Options "nosniff"
+
+        # Referrer policy
+        Referrer-Policy "strict-origin-when-cross-origin"
+
+        # Remove server header
+        -Server
+    }
+
+    # Optional: Rate limiting (requires caddy-ratelimit plugin)
+    # rate_limit {
+    #     zone seznam_proxy {
+    #         key {remote_host}
+    #         events 100
+    #         window 1m
+    #     }
+    # }
+}
+
+# Optional: Redirect HTTP to HTTPS
+# http://sez-aut.cyn.cz {
+#     redir https://{host}{uri} permanent
+# }

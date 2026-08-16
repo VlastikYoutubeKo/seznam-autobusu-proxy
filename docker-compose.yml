@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  seznam-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: seznam-autobusu-proxy
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - PORT=3000
+      - UPSTREAM_PROXY=${UPSTREAM_PROXY:-}
+      - COOKIE_SECRET=${COOKIE_SECRET:-seznam-proxy-secret-change-me}
+      - NODE_ENV=${NODE_ENV:-production}
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - proxy-network
+
+networks:
+  proxy-network:
+    driver: bridge
